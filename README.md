@@ -1,4 +1,24 @@
-# CleanRL (Clean Implementation of RL Algorithms)
+# Dual-SPMA
+
+## Environment Setup
+
+```bash
+conda create -n dual_spma python=3.10 -y
+conda activate dual_spma
+
+pip install uv
+uv pip install .
+```
+
+Run PPO on FrozenLake (videos saved to ./videos/)
+
+```bash
+python -m cleanrl.ppo --env-id FrozenLake-v1 --capture_video
+```
+
+
+
+<!-- # CleanRL (Clean Implementation of RL Algorithms)
 
 
 [<img src="https://img.shields.io/badge/license-MIT-blue">](https://github.com/vwxyzjn/cleanrl)
@@ -205,4 +225,4 @@ CleanRL is a community-powered by project and our contributors run experiments o
 
 * We thank many contributors for using their own computers to run experiments
 * We thank Google's [TPU research cloud](https://sites.research.google/trc/about/) for providing TPU resources.
-* We thank [Hugging Face](https://huggingface.co/)'s cluster for providing GPU resources. 
+* We thank [Hugging Face](https://huggingface.co/)'s cluster for providing GPU resources.  -->
