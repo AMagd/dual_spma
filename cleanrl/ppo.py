@@ -12,6 +12,8 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
+from gymnasium.spaces import Box
+import numpy as np
 
 
 @dataclass
@@ -80,15 +82,39 @@ class Args:
 
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
+        # --- create env ---
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.make(env_id, render_mode="rgb_array", is_slippery=False)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
+            env = gym.make(env_id, is_slippery=False)
+
         env = gym.wrappers.RecordEpisodeStatistics(env)
+
+        # --- if it's a Discrete observation (e.g. FrozenLake), make it one-hot ---
+        if isinstance(env.observation_space, gym.spaces.Discrete):
+            n_states = env.observation_space.n
+
+            def obs_to_one_hot(s):
+                # s is an int in [0, n_states-1]
+                one_hot = np.zeros(n_states, dtype=np.float32)
+                one_hot[s] = 1.0
+                return one_hot
+
+            env = gym.wrappers.TransformObservation(env, obs_to_one_hot)
+
+            env.observation_space = Box(
+                low=0.0,
+                high=1.0,
+                shape=(n_states,),
+                dtype=np.float32,
+            )
+
+
         return env
 
     return thunk
+
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
