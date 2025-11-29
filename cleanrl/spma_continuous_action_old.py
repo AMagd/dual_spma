@@ -12,6 +12,8 @@ import torch.optim as optim
 import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
+from cleanrl.armijo import armijo_line_search, get_grad_list, grad_norm_sq
+
 
 
 @dataclass
@@ -42,7 +44,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 300000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
@@ -82,6 +84,19 @@ class Args:
     """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
+
+    # Armijo specific
+    eta: float = 0.05
+    """mirror descent step size"""
+
+    actor_lr: float = 1e-2
+    """maximum step size for Armijo"""
+
+    armijo_c: float = 1e-4
+    """Armijo sufficient decrease constant"""
+
+    armijo_beta: float = 0.5
+    """multiplicative backtracking factor"""
 
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
@@ -180,7 +195,14 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    actor_params = list(agent.actor_mean.parameters()) + [agent.actor_logstd]
+    critic_params = list(agent.critic.parameters())
+
+    actor_optimizer = optim.Adam(actor_params, lr=1e-8)   # lr ignored if Armijo used
+    critic_optimizer = optim.Adam(critic_params, lr=args.learning_rate)
+
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -199,10 +221,16 @@ if __name__ == "__main__":
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
+        # if args.anneal_lr:
+        #     frac = 1.0 - (iteration - 1.0) / args.num_iterations
+        #     lrnow = frac * args.learning_rate
+        #     optimizer.param_groups[0]["lr"] = lrnow
+
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+            critic_optimizer.param_groups[0]["lr"] = lrnow
+
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -277,9 +305,43 @@ if __name__ == "__main__":
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                # pg_loss1 = -mb_advantages * ratio
+                # pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                # pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                
+                # SPMA surrogate
+                logratio = newlogprob - b_logprobs[mb_inds]
+
+                linear_term = -mb_advantages * logratio
+                bregman_term = (torch.exp(logratio) - 1.0 - logratio) / args.eta
+
+                pg_loss = (linear_term + bregman_term).mean()
+
+                # ================= ACTOR UPDATE =================
+                actor_optimizer.zero_grad()
+                pg_loss.backward(retain_graph=True)
+
+                grads = get_grad_list(actor_params)
+                gnsq = grad_norm_sq(grads).item()
+
+                def actor_closure():
+                    _, newlogprob2, _, _ = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                    logratio2 = newlogprob2 - b_logprobs[mb_inds]
+                    linear2 = -mb_advantages * logratio2
+                    breg2 = (torch.exp(logratio2) - 1.0 - logratio2) / args.eta
+                    return (linear2 + breg2).mean()
+
+                eta, new_f = armijo_line_search(
+                    actor_params,
+                    grads,
+                    actor_closure,
+                    f_init=pg_loss.item(),
+                    grad_norm_sq_val=gnsq,
+                    eta_max=args.actor_lr,
+                    c=args.armijo_c,
+                    beta=args.armijo_beta,
+                )
+
 
                 # Value loss
                 newvalue = newvalue.view(-1)
@@ -297,12 +359,18 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                
+                # loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                # optimizer.zero_grad()
+                # loss.backward()
+                # nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                # optimizer.step()
 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                # ================= CRITIC UPDATE =================
+                critic_optimizer.zero_grad()
+                v_loss.backward()
+                critic_optimizer.step()
+
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
@@ -312,7 +380,8 @@ if __name__ == "__main__":
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        # writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("charts/learning_rate", critic_optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
