@@ -74,12 +74,10 @@ class Args:
     """the target KL divergence threshold"""
 
     # === Convex MDP specific arguments ===
-    beta: float = 0.5
+    beta: float = 1.0
     """beta in f(d_pi) = - beta <d_pi, r> + (1-beta)*entropy(d_pi)"""
     d_bar_log_epsilon: float = 1e-8
     """small epsilon to avoid log(0) in log(d_pi)"""
-    frozenlake_map_name: str = "4x4"
-    """the name of the frozen lake map"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -99,7 +97,7 @@ def make_env(env_id, idx, capture_video, run_name):
             env = gym.make(
                 "FrozenLake-v1",
                 desc=None,
-                map_name=args.frozenlake_map_name,
+                map_name="4x4",
                 is_slippery=False,
                 render_mode="rgb_array",
             )
@@ -256,11 +254,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"ppo_cmdp__{args.beta}__{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-
-    n_possible_states = args.frozenlake_map_name.split("x")[0] ** 2
-    n_possible_actions = 4
-    max_possible_entropy = np.log(1 / (n_possible_states * n_possible_actions))
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 

@@ -257,10 +257,6 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"ppo_cmdp__{args.beta}__{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-
-    n_possible_states = args.frozenlake_map_name.split("x")[0] ** 2
-    n_possible_actions = 4
-    max_possible_entropy = np.log(1 / (n_possible_states * n_possible_actions))
     if args.track:
         import wandb
 
