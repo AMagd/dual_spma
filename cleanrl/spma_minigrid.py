@@ -41,11 +41,11 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
+    env_id: str = "MiniGrid-Empty-5x5-v0"
     """the id of the environment"""
-    total_timesteps: int = 500000
+    total_timesteps: int = 200000
     """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
+    learning_rate: float = 1.0e-3
     """the learning rate of the optimizer"""
     num_envs: int = 8
     """the number of parallel game environments"""
@@ -59,7 +59,7 @@ class Args:
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 4
     """the number of mini-batches"""
-    update_epochs: int = 5
+    update_epochs: int = 15
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
@@ -430,8 +430,7 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                # entropy_loss = entropy.mean() # NOTE REMOVE LATER!!!! encourage exploration
-                entropy_loss = 0
+                entropy_loss = entropy.mean() # NOTE REMOVE LATER!!!! encourage exploration
                 loss = policy_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
 
                 optimizer.zero_grad()
@@ -439,20 +438,20 @@ if __name__ == "__main__":
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
-            # # NOTE Optional: approximate KL between old π_t and current π_ω (for logging / early stopping)
-            # if args.target_kl is not None:
-            #     with torch.no_grad():
-            #         # KL(π_t || π_ω) ≈ E_s [ Σ_a π_t(a|s)(log π_t(a|s) - log π_ω(a|s)) ]
-            #         mb_all = b_inds  # or a random subset if you want
-            #         x_all = b_obs[mb_all].view(-1, np.prod(envs.single_observation_space.shape))
-            #         logits_new_all = agent.actor(x_all)
-            #         log_probs_new_all = torch.log_softmax(logits_new_all, dim=-1)
-            #         log_probs_old_all = torch.log_softmax(b_policy_logits[mb_all], dim=-1)
-            #         old_probs_all = torch.softmax(b_policy_logits[mb_all], dim=-1)
-            #         approx_kl = (old_probs_all * (log_probs_old_all - log_probs_new_all)).sum(dim=-1).mean()
+            # NOTE Optional: approximate KL between old π_t and current π_ω (for logging / early stopping)
+            if args.target_kl is not None:
+                with torch.no_grad():
+                    # KL(π_t || π_ω) ≈ E_s [ Σ_a π_t(a|s)(log π_t(a|s) - log π_ω(a|s)) ]
+                    mb_all = b_inds  # or a random subset if you want
+                    x_all = b_obs[mb_all].view(-1, np.prod(envs.single_observation_space.shape))
+                    logits_new_all = agent.actor(x_all)
+                    log_probs_new_all = torch.log_softmax(logits_new_all, dim=-1)
+                    log_probs_old_all = torch.log_softmax(b_policy_logits[mb_all], dim=-1)
+                    old_probs_all = torch.softmax(b_policy_logits[mb_all], dim=-1)
+                    approx_kl = (old_probs_all * (log_probs_old_all - log_probs_new_all)).sum(dim=-1).mean()
 
-            #     if approx_kl > args.target_kl:
-            #         break
+                if approx_kl > args.target_kl:
+                    break
 
 
         ##########################################################################################################

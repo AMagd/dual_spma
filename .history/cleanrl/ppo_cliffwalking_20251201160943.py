@@ -40,7 +40,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
+    env_id: str = "CliffWalking-v1"
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
@@ -135,14 +135,9 @@ def make_env(env_id, idx, capture_video, run_name):
         # --- create env ---
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            # env = GoalEnvWrapper(env)
-            env = FullyObsWrapper(env)
-            env = ImgObsWrapper(env) 
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-            env = FullyObsWrapper(env)
-            env = ImgObsWrapper(env) 
 
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
@@ -401,7 +396,7 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
+        # print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     envs.close()

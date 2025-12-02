@@ -14,10 +14,6 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 from gymnasium.spaces import Box
 import numpy as np
-import minigrid
-from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
-from minigrid.core.world_object import Goal
-
 
 
 @dataclass
@@ -66,7 +62,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.01
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -83,66 +79,15 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
-class GoalEnvWrapper(gym.Wrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        
-    def reset(self, **kwargs):
-        # 1. Reset the environment (Goal spawns at default corner)
-        obs, info = self.env.reset(**kwargs)
-        
-        # 2. Move the goal
-        self._move_goal()
-        
-        # 3. FIX: Re-generate the observation!
-        # The `obs` variable from step 1 is a lie (shows goal in corner).
-        # We need to ask the underlying MiniGrid env for the CURRENT state.
-        # We use .unwrapped to bypass any other wrappers and get the raw dict obs.
-        obs = self.env.unwrapped.gen_obs()
-        
-        return obs, info
-
-    def _move_goal(self):
-        # Access the raw minigrid object to ensure we aren't blocked by other wrappers
-        base_env = self.env.unwrapped
-        grid_w, grid_h = base_env.width, base_env.height
-
-        # --- FIX 2: FORCE REMOVE OLD GOAL ---
-        # Don't ask "is this a goal?". Just set it to None (Empty).
-        # In Empty-8x8, default goal is at (w-2, h-2).
-        base_env.grid.set(grid_w - 2, grid_h - 2, None)
-
-        # --- RANDOMIZE NEW POSITION ---
-        valid_pos = False
-        while not valid_pos:
-            goal_x = random.randint(1, grid_w - 2)
-            goal_y = random.randint(1, grid_h - 2)
-            
-            # Ensure we don't spawn on the agent
-            if (goal_x, goal_y) == base_env.agent_pos:
-                continue
-            
-            # Ensure we spawn on an empty tile (None)
-            cell = base_env.grid.get(goal_x, goal_y)
-            if cell is None:
-                valid_pos = True
-        
-        # Place the new goal
-        base_env.put_obj(Goal(), goal_x, goal_y)
 
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
         # --- create env ---
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            # env = GoalEnvWrapper(env)
-            env = FullyObsWrapper(env)
-            env = ImgObsWrapper(env) 
+            env = gym.make(env_id, render_mode="rgb_array", is_slippery=False)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
-            env = FullyObsWrapper(env)
-            env = ImgObsWrapper(env) 
+            env = gym.make(env_id, is_slippery=False)
 
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
@@ -170,9 +115,6 @@ def make_env(env_id, idx, capture_video, run_name):
 
     return thunk
 
-def ema_return(previous_ema, new_return, alpha=0.9):
-    return alpha * previous_ema + (1 - alpha) * new_return
-
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -184,17 +126,15 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        obs_dim = int(np.prod(envs.single_observation_space.shape))
-
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
@@ -202,11 +142,9 @@ class Agent(nn.Module):
         )
 
     def get_value(self, x):
-        x = x.view(x.shape[0], -1)   # ✅ FLATTEN
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        x = x.view(x.shape[0], -1)   # ✅ FLATTEN
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
@@ -270,8 +208,6 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
-    ema_return_val = None
-
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -300,15 +236,9 @@ if __name__ == "__main__":
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                        # update EMA return
-                        if ema_return_val is None:
-                            ema_return_val = info["episode"]["r"]
-                        else:
-                            ema_return_val = ema_return(ema_return_val, info["episode"]["r"])
-                        writer.add_scalar("charts/ema_episodic_return", ema_return_val, global_step)
-                        print(f"global_step={global_step}, ema_episodic_return={ema_return_val}")
 
         # bootstrap value if not done
         with torch.no_grad():
