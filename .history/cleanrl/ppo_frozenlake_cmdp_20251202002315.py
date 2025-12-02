@@ -74,7 +74,7 @@ class Args:
     """the target KL divergence threshold"""
 
     # === Convex MDP specific arguments ===
-    beta: float = 1.0
+    beta: float = 0.8
     """beta in f(d_pi) = - beta <d_pi, r> + (1-beta)*entropy(d_pi)"""
     d_bar_log_epsilon: float = 1e-8
     """small epsilon to avoid log(0) in log(d_pi)"""

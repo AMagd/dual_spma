@@ -177,10 +177,11 @@ class Agent(nn.Module):
 
 # === Convex MDP helpers ===
 
+import torch
+
 def estimate_d_pi_from_obs_action(
     obs_buffer: torch.Tensor,
     action_buffer: torch.Tensor,
-    n_actions: int,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
@@ -199,6 +200,10 @@ def estimate_d_pi_from_obs_action(
     # Shapes
     T, N, n_states = obs_buffer.shape
     device = obs_buffer.device
+
+    # Infer number of actions from buffer
+    # (assumes actions are 0..n_actions-1)
+    n_actions = int(action_buffer.max().item()) + 1
 
     # State indices from one-hot
     state_idx = obs_buffer.argmax(dim=-1).long()   # [T, N]
@@ -221,6 +226,8 @@ def estimate_d_pi_from_obs_action(
     d_sa = counts / (counts.sum() + eps)
     return d_sa
 
+
+    
 
 def update_running_average(old_avg: torch.Tensor, new_value: torch.Tensor, k: int) -> torch.Tensor:
     """
@@ -507,8 +514,8 @@ if __name__ == "__main__":
         # === After PPO update: update d_pi, d_bar (FTL), and lambda for next iteration ===
         with torch.no_grad():
             d_k = estimate_d_pi_from_obs_action(
-                obs, actions, action_space, eps=args.d_bar_log_epsilon
-            )
+                obs, action, eps=args.d_bar_log_epsilon
+            )  # [n_states]
             d_bar = update_running_average(d_bar, d_k, iteration)
 
             # Optional logging of convex objective components

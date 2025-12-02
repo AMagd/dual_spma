@@ -200,6 +200,10 @@ def estimate_d_pi_from_obs_action(
     T, N, n_states = obs_buffer.shape
     device = obs_buffer.device
 
+    # Infer number of actions from buffer
+    # (assumes actions are 0..n_actions-1)
+    n_actions = int(action_buffer.max().item()) + 1
+
     # State indices from one-hot
     state_idx = obs_buffer.argmax(dim=-1).long()   # [T, N]
     action_idx = action_buffer.long().view(T, N)   # [T, N]
@@ -507,7 +511,7 @@ if __name__ == "__main__":
         # === After PPO update: update d_pi, d_bar (FTL), and lambda for next iteration ===
         with torch.no_grad():
             d_k = estimate_d_pi_from_obs_action(
-                obs, actions, action_space, eps=args.d_bar_log_epsilon
+                obs, actions, eps=args.d_bar_log_epsilon
             )
             d_bar = update_running_average(d_bar, d_k, iteration)
 

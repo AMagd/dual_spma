@@ -44,7 +44,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 4
+    num_envs: int = 64
     """the number of parallel game environments"""
     num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
@@ -74,7 +74,7 @@ class Args:
     """the target KL divergence threshold"""
 
     # === Convex MDP specific arguments ===
-    beta: float = 1.0
+    beta: float = 0.95
     """beta in f(d_pi) = - beta <d_pi, r> + (1-beta)*entropy(d_pi)"""
     d_bar_log_epsilon: float = 1e-8
     """small epsilon to avoid log(0) in log(d_pi)"""

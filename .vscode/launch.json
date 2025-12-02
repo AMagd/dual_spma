@@ -9,11 +9,11 @@
             "name": "Python Debugger: Current File",
             "type": "debugpy",
             "request": "launch",
-            "program": "cleanrl/ppo.py",
+            "program": "cleanrl/ppo_frozenlake_cmdp.py",
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
-                "--env-id", "CliffWalking-v0",
+                "--env-id", "FrozenLake-v1",
             ]
         }
     ]

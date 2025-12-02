@@ -177,50 +177,11 @@ class Agent(nn.Module):
 
 # === Convex MDP helpers ===
 
-def estimate_d_pi_from_obs_action(
-    obs_buffer: torch.Tensor,
-    action_buffer: torch.Tensor,
-    n_actions: int,
-    eps: float = 1e-8,
-) -> torch.Tensor:
+def estimate_d_pi_from_obs_action(obs_buffer: torch.Tensor, action_buffer: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
-    Monte Carlo estimate of state-action occupancy d_pi(s, a) from one-hot observations
-    and discrete actions.
-
-    Args:
-        obs_buffer:    Tensor of shape [T, N, n_states], one-hot encoding of states.
-        action_buffer: Tensor of shape [T, N], integer actions in [0, n_actions-1].
-        eps:           Small constant to avoid division by zero.
-
-    Returns:
-        d_sa: Tensor of shape [n_states, n_actions] such that
-              d_sa[s, a] ≈ visitation rate of (s, a), and d_sa.sum() ≈ 1.
+    Monte Carlo estimate of state occupancy d_pi(s) from one-hot observations.
     """
-    # Shapes
-    T, N, n_states = obs_buffer.shape
-    device = obs_buffer.device
-
-    # State indices from one-hot
-    state_idx = obs_buffer.argmax(dim=-1).long()   # [T, N]
-    action_idx = action_buffer.long().view(T, N)   # [T, N]
-
-    # Flatten to 1D lists of (s, a)
-    flat_s = state_idx.view(-1)                    # [T*N]
-    flat_a = action_idx.view(-1)                   # [T*N]
-
-    # Count visits to each (s, a)
-    counts = torch.zeros(n_states, n_actions, device=device)
-    lin_idx = flat_s * n_actions + flat_a          # [T*N] linear indices
-    counts.view(-1).index_add_(
-        0,
-        lin_idx,
-        torch.ones_like(lin_idx, dtype=torch.float32, device=device),
-    )
-
-    # Normalize to get an empirical occupancy measure (visitation rate)
-    d_sa = counts / (counts.sum() + eps)
-    return d_sa
-
+    
 
 def update_running_average(old_avg: torch.Tensor, new_value: torch.Tensor, k: int) -> torch.Tensor:
     """
@@ -507,8 +468,8 @@ if __name__ == "__main__":
         # === After PPO update: update d_pi, d_bar (FTL), and lambda for next iteration ===
         with torch.no_grad():
             d_k = estimate_d_pi_from_obs_action(
-                obs, actions, action_space, eps=args.d_bar_log_epsilon
-            )
+                obs, action, eps=args.d_bar_log_epsilon
+            )  # [n_states]
             d_bar = update_running_average(d_bar, d_k, iteration)
 
             # Optional logging of convex objective components

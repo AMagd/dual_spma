@@ -74,9 +74,9 @@ class Args:
     """the target KL divergence threshold"""
 
     # === Convex MDP specific arguments ===
-    beta: float = 1.0
+    beta: float = 0.999
     """beta in f(d_pi) = - beta <d_pi, r> + (1-beta)*entropy(d_pi)"""
-    d_bar_log_epsilon: float = 1e-8
+    d_pi_log_epsilon: float = 1e-8
     """small epsilon to avoid log(0) in log(d_pi)"""
 
     # to be filled in runtime
@@ -163,11 +163,11 @@ class Agent(nn.Module):
         )
 
     def get_value(self, x):
-        x = x.view(x.shape[0], -1)
+        x = x.view(x.shape[0], -1)  # ✅ FLATTEN
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        x = x.view(x.shape[0], -1)
+        x = x.view(x.shape[0], -1)  # ✅ FLATTEN
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
@@ -175,49 +175,36 @@ class Agent(nn.Module):
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
 
-# === Convex MDP helpers ===
+# === Convex MDP helpers (model-free, over (s,a)) ===
 
-def estimate_d_pi_from_obs_action(
+def estimate_d_pi_sa(
     obs_buffer: torch.Tensor,
     action_buffer: torch.Tensor,
+    n_states: int,
     n_actions: int,
+    device: torch.device,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Monte Carlo estimate of state-action occupancy d_pi(s, a) from one-hot observations
-    and discrete actions.
+    Monte Carlo estimate of state-action occupancy d_pi(s,a).
 
-    Args:
-        obs_buffer:    Tensor of shape [T, N, n_states], one-hot encoding of states.
-        action_buffer: Tensor of shape [T, N], integer actions in [0, n_actions-1].
-        eps:           Small constant to avoid division by zero.
-
-    Returns:
-        d_sa: Tensor of shape [n_states, n_actions] such that
-              d_sa[s, a] ≈ visitation rate of (s, a), and d_sa.sum() ≈ 1.
+    obs_buffer:    [T, N, n_states] one-hot states
+    action_buffer: [T, N]           integer actions
+    returns:       [n_states, n_actions] with sum ~ 1
     """
-    # Shapes
-    T, N, n_states = obs_buffer.shape
-    device = obs_buffer.device
+    T, N, _ = obs_buffer.shape
+    state_idx = obs_buffer.argmax(dim=-1).long()        # [T, N]
+    act_idx = action_buffer.long().view(T, N)           # [T, N]
 
-    # State indices from one-hot
-    state_idx = obs_buffer.argmax(dim=-1).long()   # [T, N]
-    action_idx = action_buffer.long().view(T, N)   # [T, N]
+    flat_s = state_idx.view(-1)                         # [T*N]
+    flat_a = act_idx.view(-1)                           # [T*N]
 
-    # Flatten to 1D lists of (s, a)
-    flat_s = state_idx.view(-1)                    # [T*N]
-    flat_a = action_idx.view(-1)                   # [T*N]
-
-    # Count visits to each (s, a)
     counts = torch.zeros(n_states, n_actions, device=device)
-    lin_idx = flat_s * n_actions + flat_a          # [T*N] linear indices
+    lin_idx = flat_s * n_actions + flat_a
     counts.view(-1).index_add_(
-        0,
-        lin_idx,
-        torch.ones_like(lin_idx, dtype=torch.float32, device=device),
+        0, lin_idx, torch.ones_like(lin_idx, dtype=torch.float32, device=device)
     )
 
-    # Normalize to get an empirical occupancy measure (visitation rate)
     d_sa = counts / (counts.sum() + eps)
     return d_sa
 
@@ -225,26 +212,26 @@ def estimate_d_pi_from_obs_action(
 def update_running_average(old_avg: torch.Tensor, new_value: torch.Tensor, k: int) -> torch.Tensor:
     """
     Running average d_bar^{(k)} = ( (k-1)/k ) d_bar^{(k-1)} + (1/k) d^{(k)}.
+    Works elementwise for tensors of any shape.
     """
     if k == 1:
         return new_value
     return (old_avg * (k - 1) + new_value) / k
 
-def lambda_reward_reshape(r, d_bar, beta, eps):
+
+def grad_f_from_d_bar_sa(
+    d_bar_sa: torch.Tensor,
+    r_hat_sa: torch.Tensor,
+    beta: float,
+    eps: float,
+) -> torch.Tensor:
     """
-    modify the reward based on the convex MDP objective
-    
+    f(d_pi) = -beta <d_pi, r> + (1 - beta) * entropy(d_pi),
+    with d_pi, r over (s,a).
+
+    grad_f(d_pi)(s,a) = -beta * r(s,a) + (1 - beta) * (1 + log d_pi(s,a)).
     """
-    if not isinstance(r, torch.Tensor):
-        r = torch.tensor(r)
-    # if not isinstance(d_bar, torch.Tensor):
-    #     d_bar = torch.tensor(d_bar)
-    # if not isinstance(beta, torch.Tensor):
-    #     beta = torch.tensor(beta)
-    # if not isinstance(eps, torch.Tensor):
-    #     eps = torch.tensor(eps)
-    r_new = - beta * r + (1.0 - beta) * (1.0 + torch.log(d_bar + eps))
-    return r_new
+    return -beta * r_hat_sa + (1.0 - beta) * (1.0 + torch.log(d_bar_sa + eps))
 
 
 if __name__ == "__main__":
@@ -291,35 +278,43 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # --- Convex MDP: d_pi is a function of (s,a) and r is a function of (s,a) ---
+    # --- Dimensions for (s,a) space ---
     n_states = envs.single_observation_space.shape[0]
-    action_space = envs.single_action_space.n
+    n_actions = envs.single_action_space.n
 
-    # initialize d_bar uniformly and lambda_1 from it
-    d_bar = torch.ones(n_states, action_space, device=device) / (n_states * action_space)
-    
-    # initialize d_bar randomly
-    # d_bar = torch.rand(n_states, action_space, device=device)
-    # d_bar = d_bar / d_bar.sum(dim=-1, keepdim=True)
+    # --- Model-free reward estimates r_hat(s,a) ---
+    r_sum_sa = torch.zeros(n_states, n_actions, device=device)
+    count_sa = torch.zeros(n_states, n_actions, device=device)
+    r_hat_sa = torch.zeros(n_states, n_actions, device=device)
+
+    # --- Convex MDP: d_bar(s,a) running average + lambda(s,a) ---
+    d_bar_sa = torch.ones(n_states, n_actions, device=device)
+    d_bar_sa = d_bar_sa / d_bar_sa.sum()  # uniform initial occupancy
+    lambda_sa = grad_f_from_d_bar_sa(
+        d_bar_sa, r_hat_sa, beta=args.beta, eps=args.d_pi_log_epsilon
+    )  # [n_states, n_actions]
 
     # ALGO Logic: Storage setup
     obs = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_observation_space.shape
-    ).to(device)
+        (args.num_steps, args.num_envs) + envs.single_observation_space.shape,
+        device=device,
+    )
     actions = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_action_space.shape
-    ).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)  # will store shaped reward -lambda
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        (args.num_steps, args.num_envs) + envs.single_action_space.shape,
+        dtype=torch.long,
+        device=device,
+    )
+    logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
+    rewards = torch.zeros((args.num_steps, args.num_envs), device=device)  # shaped reward -lambda
+    dones = torch.zeros((args.num_steps, args.num_envs), device=device)
+    values = torch.zeros((args.num_steps, args.num_envs), device=device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+    next_done = torch.zeros(args.num_envs, device=device)
 
     ema_return_val = None
 
@@ -330,7 +325,7 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
-        # === Rollout with fixed lambda_k (cost player FTL; lambda_k is fixed this iteration) ===
+        # === Rollout with fixed lambda_sa (cost player FTL; lambda_k is fixed this iteration) ===
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -347,21 +342,28 @@ if __name__ == "__main__":
             next_obs_np, env_reward, terminations, truncations, infos = envs.step(
                 action.cpu().numpy()
             )
-            # We keep env_reward only for logging; PPO optimization uses shaped reward.
-            next_done = np.logical_or(terminations, truncations)
+            next_done_np = np.logical_or(terminations, truncations)
 
-            # === Convex MDP reward shaping: r'_t = -lambda_k(s_t) ===
-            # obs[step] is one-hot over states; use argmax to get state index.
-            state_indices = obs[step].argmax(dim=-1).long()  # [num_envs]
-            d_bar_value = d_bar[state_indices, action]
-            shaped_reward = -lambda_reward_reshape(env_reward, d_bar_value, args.beta, args.d_bar_log_epsilon)
+            # --- Update r_hat(s,a) from sampled rewards (purely from data) ---
+            state_indices = obs[step].argmax(dim=-1).long()             # [num_envs]
+            action_indices = actions[step].long().view(-1)             # [num_envs]
+            env_reward_t = torch.tensor(env_reward, device=device).view(-1)  # [num_envs]
+
+            lin_idx = state_indices * n_actions + action_indices
+            # accumulate sums and counts
+            r_sum_sa.view(-1).index_add_(0, lin_idx, env_reward_t)
+            count_sa.view(-1).index_add_(
+                0, lin_idx, torch.ones_like(env_reward_t, dtype=torch.float32, device=device)
+            )
+            r_hat_sa = r_sum_sa / (count_sa + args.d_pi_log_epsilon)
+
+            # --- Convex MDP reward shaping: r'_t = -lambda_k(s_t, a_t) ---
+            shaped_reward = -lambda_sa[state_indices, action_indices]   # [num_envs]
             rewards[step] = shaped_reward
 
             # Convert next_obs and done to tensors
-            next_obs, next_done = (
-                torch.Tensor(next_obs_np).to(device),
-                torch.Tensor(next_done).to(device),
-            )
+            next_obs = torch.Tensor(next_obs_np).to(device)
+            next_done = torch.Tensor(next_done_np).to(device)
 
             # Logging original environment episodic return (not the convex objective)
             if "final_info" in infos:
@@ -396,7 +398,7 @@ if __name__ == "__main__":
         # === GAE and returns use shaped reward r' ===
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
+            advantages = torch.zeros_like(rewards, device=device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
@@ -504,19 +506,29 @@ if __name__ == "__main__":
             np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
         )
 
-        # === After PPO update: update d_pi, d_bar (FTL), and lambda for next iteration ===
+        # === After PPO update: update d_pi(s,a), d_bar(s,a) (FTL), and lambda(s,a) ===
         with torch.no_grad():
-            d_k = estimate_d_pi_from_obs_action(
-                obs, actions, action_space, eps=args.d_bar_log_epsilon
+            d_k_sa = estimate_d_pi_sa(
+                obs, actions, n_states, n_actions, device, eps=args.d_pi_log_epsilon
+            )  # [n_states, n_actions]
+
+            d_bar_sa = update_running_average(d_bar_sa, d_k_sa, iteration)
+            lambda_sa = grad_f_from_d_bar_sa(
+                d_bar_sa, r_hat_sa, beta=args.beta, eps=args.d_pi_log_epsilon
             )
-            d_bar = update_running_average(d_bar, d_k, iteration)
 
             # Optional logging of convex objective components
-            entropy_d = -(d_bar * torch.log(d_bar + args.d_bar_log_epsilon)).sum()
+            entropy_d = -(d_bar_sa * torch.log(d_bar_sa + args.d_pi_log_epsilon)).sum()
+            inner_prod = (d_bar_sa * r_hat_sa).sum()
+            f_val = -args.beta * inner_prod + (1.0 - args.beta) * entropy_d
 
             writer.add_scalar(
                 "convex_mdp/entropy_d_bar", entropy_d.item(), global_step
             )
+            writer.add_scalar(
+                "convex_mdp/inner_prod_d_rhat", inner_prod.item(), global_step
+            )
+            writer.add_scalar("convex_mdp/f_value", f_val.item(), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar(

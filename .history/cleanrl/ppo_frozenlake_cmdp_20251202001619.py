@@ -507,7 +507,7 @@ if __name__ == "__main__":
         # === After PPO update: update d_pi, d_bar (FTL), and lambda for next iteration ===
         with torch.no_grad():
             d_k = estimate_d_pi_from_obs_action(
-                obs, actions, action_space, eps=args.d_bar_log_epsilon
+                obs, actions, eps=args.d_bar_log_epsilon
             )
             d_bar = update_running_average(d_bar, d_k, iteration)
 
