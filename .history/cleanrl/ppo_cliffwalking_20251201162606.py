@@ -40,7 +40,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "FrozenLake-v1"
+    env_id: str = "CliffWalking-v1"
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
@@ -66,7 +66,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.0
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -83,20 +83,11 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
-
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
         # --- create env ---
         if capture_video and idx == 0:
-            env = gym.make(
-                'FrozenLake-v1',
-                desc=None,
-                map_name="4x4",
-                is_slippery=False,
-                render_mode="rgb_array",
-                # success_rate=1.0/3.0,
-                # reward_schedule=(1, 0, 0)
-            )            
+            env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)

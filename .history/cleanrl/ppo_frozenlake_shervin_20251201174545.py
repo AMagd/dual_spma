@@ -1,4 +1,4 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppopy
+import math
 import os
 import random
 import time
@@ -12,124 +12,72 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-from gymnasium.spaces import Box
-import numpy as np
-import minigrid
-from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
-from minigrid.core.world_object import Goal
-
+from gymnasium.envs.toy_text.frozen_lake import generate_random_map
 
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
     seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
     track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
     wandb_entity: str = None
-    """the entity (team) of wandb's project"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
+    capture_video: bool = True
 
     # Algorithm specific arguments
     env_id: str = "FrozenLake-v1"
-    """the id of the environment"""
-    total_timesteps: int = 500000
-    """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
-    """the learning rate of the optimizer"""
-    num_envs: int = 4
-    """the number of parallel game environments"""
+    total_timesteps: int = 2000000
+    learning_rate: float = 1e-3
+    num_envs: int = 8
     num_steps: int = 128
-    """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
-    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
     num_minibatches: int = 4
-    """the number of mini-batches"""
     update_epochs: int = 4
-    """the K epochs to update the policy"""
     norm_adv: bool = True
-    """Toggles advantages normalization"""
     clip_coef: float = 0.2
-    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
     ent_coef: float = 0.01
-    """coefficient of the entropy"""
     vf_coef: float = 0.5
-    """coefficient of the value function"""
     max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
     target_kl: float = None
-    """the target KL divergence threshold"""
+    map_size: int = 10
+    
+    # Occupancy Maximization Args
+    occ_ent_coef: float = 10000000000000000.0
 
     # to be filled in runtime
     batch_size: int = 0
-    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, run_name):
+class OneHotWrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.n = env.observation_space.n
+        self.observation_space = gym.spaces.Box(0, 1, (self.n,), dtype=np.float32)
+
+    def observation(self, obs):
+        one_hot = np.zeros(self.n, dtype=np.float32)
+        one_hot[obs] = 1.0
+        return one_hot
+
+
+def make_env(env_id, idx, capture_video, run_name, map_desc):
     def thunk():
-        # --- create env ---
         if capture_video and idx == 0:
-            env = gym.make(
-                'FrozenLake-v1',
-                desc=None,
-                map_name="4x4",
-                is_slippery=False,
-                render_mode="rgb_array",
-                # success_rate=1.0/3.0,
-                # reward_schedule=(1, 0, 0)
-            )            
+            env = gym.make(env_id, render_mode="rgb_array", desc=map_desc, is_slippery=False)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
-
+            env = gym.make(env_id, desc=map_desc, is_slippery=False)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-
-        # --- if it's a Discrete observation (e.g. FrozenLake), make it one-hot ---
-        if isinstance(env.observation_space, gym.spaces.Discrete):
-            n_states = env.observation_space.n
-
-            def obs_to_one_hot(s):
-                # s is an int in [0, n_states-1]
-                one_hot = np.zeros(n_states, dtype=np.float32)
-                one_hot[s] = 1.0
-                return one_hot
-
-            env = gym.wrappers.TransformObservation(env, obs_to_one_hot)
-
-            env.observation_space = Box(
-                low=0.0,
-                high=1.0,
-                shape=(n_states,),
-                dtype=np.float32,
-            )
-
-
+        env = OneHotWrapper(env)
         return env
-
     return thunk
-
-def ema_return(previous_ema, new_return, alpha=0.9):
-    return alpha * previous_ema + (1 - alpha) * new_return
-
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -138,48 +86,104 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
+def safe_occ_value(value: float) -> float:
+    return value if math.isfinite(value) else 0.0
+
+
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        obs_dim = int(np.prod(envs.single_observation_space.shape))
-
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 64)),
+        input_dim = np.array(envs.single_observation_space.shape).prod()
+        self.network = nn.Sequential(
+            layer_init(nn.Linear(input_dim, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
-        )
+        self.actor = layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(64, 1), std=1)
 
     def get_value(self, x):
-        x = x.view(x.shape[0], -1)   # ✅ FLATTEN
-        return self.critic(x)
+        return self.critic(self.network(x))
 
     def get_action_and_value(self, x, action=None):
-        x = x.view(x.shape[0], -1)   # ✅ FLATTEN
-        logits = self.actor(x)
+        hidden = self.network(x)
+        logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
+# -------------------------------------------------------------------------
+# OCCUPANCY FUNCTIONS
+# -------------------------------------------------------------------------
+
+def get_transition_tensor(env, map_size, device):
+    ns = map_size * map_size
+    na = env.action_space.n
+    P_tensor = torch.zeros((ns, na, ns), device=device)
+    P_dict = env.unwrapped.P
+    for s in range(ns):
+        for a in range(na):
+            if s in P_dict and a in P_dict[s]:
+                transitions = P_dict[s][a]
+                for prob, next_s, _, _ in transitions:
+                    P_tensor[s, a, next_s] += prob
+    
+    row_sums = P_tensor.sum(dim=2)
+    mask = (row_sums == 0)
+    if mask.any():
+        for s in range(ns):
+            for a in range(na):
+                if mask[s, a]:
+                    P_tensor[s, a, s] = 1.0
+    return P_tensor
+
+def get_occupancy(agent, P_tensor, device, map_size, gamma=0.99):
+    num_states = map_size * map_size
+    
+    # 1. Get Policy Matrix pi(a|s)
+    all_states_idx = torch.arange(num_states, device=device).long()
+    all_states_onehot = torch.nn.functional.one_hot(all_states_idx, num_classes=num_states).float()
+    
+    hidden = agent.network(all_states_onehot)
+    logits = agent.actor(hidden)
+    pi_probs = torch.softmax(logits, dim=1) 
+    
+    # 2. Compute Transition Matrix P_pi
+    P_pi = torch.einsum('sa,san->sn', pi_probs, P_tensor)
+    
+    # 3. Solve linear system for stationary distribution d(s)
+    I = torch.eye(num_states, device=device)
+    # Adding small jitter to diagonal for numerical stability
+    A_mat = (I - gamma * P_pi).T + 1e-6 * I
+    
+    rho = torch.zeros(num_states, device=device)
+    rho[0] = 1.0
+    b = (1 - gamma) * rho
+    
+    try:
+        d_s = torch.linalg.solve(A_mat, b)
+    except RuntimeError:
+        d_s = torch.ones(num_states, device=device) / num_states
+
+    # 4. Joint State-Action Distribution
+    d_s = torch.clamp(d_s, min=1e-12)
+    d_s = d_s / d_s.sum() 
+    d_sa = d_s.unsqueeze(1) * pi_probs 
+    
+    return d_sa
+
+# -------------------------------------------------------------------------
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}_{args.map_size}x{args.map_size}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -189,28 +193,41 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    writer = SummaryWriter(f"runs/{run_name}", flush_secs=10)
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-
-    # env setup
+    random_map = generate_random_map(size=args.map_size, p=0.8)
+    
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, run_name, random_map) for i in range(args.num_envs)],
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-
+    ref_env = gym.make(args.env_id, desc=random_map, is_slippery=False)
+    P_tensor = get_transition_tensor(ref_env, args.map_size, device)
+    
     agent = Agent(envs).to(device)
+    
+    # ----------------------------------------------------------------------
+    # FTL (Follow the Leader) Setup
+    # ----------------------------------------------------------------------
+    # We do NOT add lambda to the optimizer. Lambda is determined explicitly 
+    # by the history of occupancies.
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    
+    # Storage for FTL history (Cumulative sum of d_sa)
+    # Shape: (Num States, Num Actions)
+    num_states = args.map_size * args.map_size
+    num_actions = envs.single_action_space.n
+    cumulative_d_sa = torch.zeros(num_states, num_actions, device=device)
+    ftl_update_count = 0
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -220,17 +237,13 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
-    # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
-    ema_return_val = None
-
     for iteration in range(1, args.num_iterations + 1):
-        # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
@@ -241,14 +254,12 @@ if __name__ == "__main__":
             obs[step] = next_obs
             dones[step] = next_done
 
-            # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
-            # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
@@ -257,17 +268,11 @@ if __name__ == "__main__":
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                        # update EMA return
-                        if ema_return_val is None:
-                            ema_return_val = info["episode"]["r"]
-                        else:
-                            ema_return_val = ema_return(ema_return_val, info["episode"]["r"])
-                        writer.add_scalar("charts/ema_episodic_return", ema_return_val, global_step)
-                        print(f"global_step={global_step}, ema_episodic_return={ema_return_val}")
 
-        # bootstrap value if not done
+        # bootstrap value
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
@@ -283,7 +288,6 @@ if __name__ == "__main__":
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
-        # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
@@ -291,7 +295,6 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -305,7 +308,6 @@ if __name__ == "__main__":
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -314,12 +316,10 @@ if __name__ == "__main__":
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
@@ -339,27 +339,69 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
+        # ---------------------------------------------------------------------
+        # FTL (Follow the Leader) UPDATE STEP
+        # ---------------------------------------------------------------------
+        
+        optimizer.zero_grad()
+        
+        # 1. Get current occupancy d_pi (using lower gamma for stability/diversity as discussed)
+        d_sa = get_occupancy(agent, P_tensor, device, args.map_size, gamma=0.99)
+        
+        # 2. Update FTL History (Avg Occupancy)
+        # We need the average of past occupancies: d_bar = (1/k) * sum(d_j)
+        with torch.no_grad():
+            cumulative_d_sa += d_sa.detach()
+            ftl_update_count += 1
+            avg_d_sa = cumulative_d_sa / ftl_update_count
+            
+            # 3. Calculate Lambda using FTL rule: lambda^k = grad f(d_bar)
+            # f(d) = d log d  =>  grad f(d) = 1 + log(d)
+            # We add epsilon to prevent log(0)
+            lambda_ftl = 1.0 + torch.log(avg_d_sa + 1e-12)
+
+        # 4. Best Response Policy Update
+        # The agent minimizes: d_pi * lambda^k
+        # (This discourages visiting states that have been visited often in the past)
+        # We assume lambda_ftl is fixed (constant) for this gradient step.
+        
+        loss_ftl = (d_sa * lambda_ftl).sum() * args.occ_ent_coef
+        
+        loss_ftl.backward()
+        nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+        optimizer.step()
+        
+        # ---------------------------------------------------------------------
+
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+        
+        # Logging
+        with torch.no_grad():
+            valid_mask = d_sa > 1e-12
+            exact_d_log_d = (d_sa[valid_mask] * torch.log(d_sa[valid_mask])).sum()
+            exact_occ_entropy = safe_occ_value(-exact_d_log_d.item())
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        # print("SPS:", int(global_step / (time.time() - start_time)))
+        writer.add_scalar("losses/grad_norm", grad_norm.item(), global_step)
+        writer.add_scalar("charts/exact_occupancy_entropy", exact_occ_entropy, global_step)
+        writer.add_scalar("charts/ftl_loss_val", loss_ftl.item(), global_step)
+
+        print(f"SPS: {int(global_step / (time.time() - start_time))}, OccEntropy: {exact_occ_entropy:.4f}")
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        
+        writer.flush()
 
     envs.close()
+    ref_env.close()
     writer.close()

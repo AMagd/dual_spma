@@ -13,11 +13,6 @@ import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 from gymnasium.spaces import Box
-import numpy as np
-import minigrid
-from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
-from minigrid.core.world_object import Goal
-
 
 
 @dataclass
@@ -40,7 +35,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "FrozenLake-v1"
+    env_id: str = "CartPole-v1"
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
@@ -86,24 +81,14 @@ class Args:
 
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
-        # --- create env ---
         if capture_video and idx == 0:
-            env = gym.make(
-                'FrozenLake-v1',
-                desc=None,
-                map_name="4x4",
-                is_slippery=False,
-                render_mode="rgb_array",
-                # success_rate=1.0/3.0,
-                # reward_schedule=(1, 0, 0)
-            )            
+            env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
-        # --- if it's a Discrete observation (e.g. FrozenLake), make it one-hot ---
+        # --- if it's a Discrete observation (e.g. FrozenLake, CliffWalking), make it one-hot ---
         if isinstance(env.observation_space, gym.spaces.Discrete):
             n_states = env.observation_space.n
 
@@ -122,14 +107,9 @@ def make_env(env_id, idx, capture_video, run_name):
                 dtype=np.float32,
             )
 
-
         return env
 
     return thunk
-
-def ema_return(previous_ema, new_return, alpha=0.9):
-    return alpha * previous_ema + (1 - alpha) * new_return
-
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -142,7 +122,6 @@ class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         obs_dim = int(np.prod(envs.single_observation_space.shape))
-
         self.critic = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 64)),
             nn.Tanh(),
@@ -159,11 +138,9 @@ class Agent(nn.Module):
         )
 
     def get_value(self, x):
-        x = x.view(x.shape[0], -1)   # ✅ FLATTEN
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        x = x.view(x.shape[0], -1)   # ✅ FLATTEN
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
@@ -227,8 +204,6 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
-    ema_return_val = None
-
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -257,15 +232,9 @@ if __name__ == "__main__":
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                        # update EMA return
-                        if ema_return_val is None:
-                            ema_return_val = info["episode"]["r"]
-                        else:
-                            ema_return_val = ema_return(ema_return_val, info["episode"]["r"])
-                        writer.add_scalar("charts/ema_episodic_return", ema_return_val, global_step)
-                        print(f"global_step={global_step}, ema_episodic_return={ema_return_val}")
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -358,7 +327,7 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        # print("SPS:", int(global_step / (time.time() - start_time)))
+        print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     envs.close()

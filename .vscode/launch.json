@@ -9,11 +9,11 @@
             "name": "Python Debugger: Current File",
             "type": "debugpy",
             "request": "launch",
-            "program": "cleanrl/spma_minigrid.py",
+            "program": "cleanrl/ppo.py",
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
-                "--env-id", "MiniGrid-Empty-5x5-v0",
+                "--env-id", "CliffWalking-v0",
             ]
         }
     ]

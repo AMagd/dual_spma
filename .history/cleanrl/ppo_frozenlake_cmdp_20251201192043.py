@@ -13,11 +13,9 @@ import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 from gymnasium.spaces import Box
-import numpy as np
 import minigrid
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
 from minigrid.core.world_object import Goal
-
 
 
 @dataclass
@@ -44,7 +42,7 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     num_envs: int = 4
     """the number of parallel game environments"""
@@ -58,7 +56,7 @@ class Args:
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 4
     """the number of mini-batches"""
-    update_epochs: int = 4
+    update_epochs: int = 10
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
@@ -66,7 +64,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.1
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -74,6 +72,12 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
+
+    # === Convex MDP specific arguments ===
+    beta: float = 0.5
+    """beta in f(d_pi) = beta <d_pi, r> + (1-beta)*entropy(d_pi)"""
+    d_pi_log_epsilon: float = 1e-8
+    """small epsilon to avoid log(0) in log(d_pi)"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -89,17 +93,18 @@ def make_env(env_id, idx, capture_video, run_name):
         # --- create env ---
         if capture_video and idx == 0:
             env = gym.make(
-                'FrozenLake-v1',
+                "FrozenLake-v1",
                 desc=None,
                 map_name="4x4",
                 is_slippery=False,
                 render_mode="rgb_array",
-                # success_rate=1.0/3.0,
-                # reward_schedule=(1, 0, 0)
-            )            
+            )
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
+            if env_id == "FrozenLake-v1":
+                env = gym.make(env_id, is_slippery=False)
+            else:
+                env = gym.make(env_id)
 
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
@@ -122,14 +127,13 @@ def make_env(env_id, idx, capture_video, run_name):
                 dtype=np.float32,
             )
 
-
         return env
 
     return thunk
 
+
 def ema_return(previous_ema, new_return, alpha=0.9):
     return alpha * previous_ema + (1 - alpha) * new_return
-
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -159,16 +163,89 @@ class Agent(nn.Module):
         )
 
     def get_value(self, x):
-        x = x.view(x.shape[0], -1)   # ✅ FLATTEN
+        x = x.view(x.shape[0], -1)  # ✅ FLATTEN
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        x = x.view(x.shape[0], -1)   # ✅ FLATTEN
+        x = x.view(x.shape[0], -1)  # ✅ FLATTEN
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+
+
+# === Convex MDP helpers ===
+
+def build_state_reward_vector(env_id: str, device: torch.device) -> torch.Tensor:
+    """
+    Build r(s) as a vector over states using the underlying FrozenLake transition structure.
+    For FrozenLake-v1 this will basically be 1.0 at the goal state, 0.0 elsewhere.
+    """
+    # Create a bare (non-vectorized) env to inspect transitions.
+    if env_id == "FrozenLake-v1":
+        base_env = gym.make(env_id, is_slippery=False)
+    else:
+        base_env = gym.make(env_id)
+
+    assert isinstance(
+        base_env.observation_space, gym.spaces.Discrete
+    ), "build_state_reward_vector assumes discrete states"
+
+    n_states = base_env.observation_space.n
+    n_actions = base_env.action_space.n
+    P = base_env.unwrapped.P  # P[s][a] = list of (prob, next_state, reward, done)
+
+    r_vec = torch.zeros(n_states, dtype=torch.float32, device=device)
+
+    for s in range(n_states):
+        # expected immediate reward if we pick actions uniformly at random
+        r_s = 0.0
+        for a in range(n_actions):
+            transitions = P[s][a]
+            for p, next_s, reward, done in transitions:
+                r_s += p * reward
+        r_s /= n_actions
+        r_vec[s] = r_s
+
+    base_env.close()
+    return r_vec
+
+
+def estimate_d_pi_from_obs(obs_buffer: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Monte Carlo estimate of state occupancy d_pi(s) from one-hot observations.
+
+    obs_buffer: [T, N, n_states] tensor with one-hot encoding over states.
+    returns:   [n_states] tensor, sum ~ 1.
+    """
+    T, N, n_states = obs_buffer.shape
+    flat = obs_buffer.reshape(-1, n_states)  # [(T*N), n_states]
+    d = flat.mean(dim=0)  # average one-hot -> empirical distribution
+    d = d / (d.sum() + eps)
+    return d
+
+
+def update_running_average(old_avg: torch.Tensor, new_value: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    Running average d_bar^{(k)} = ( (k-1)/k ) d_bar^{(k-1)} + (1/k) d^{(k)}.
+    """
+    if k == 1:
+        return new_value
+    return (old_avg * (k - 1) + new_value) / k
+
+
+def grad_f_from_d_bar(
+    d_bar: torch.Tensor, r_vec: torch.Tensor, beta: float, eps: float
+) -> torch.Tensor:
+    """
+    Implements exactly the gradient you gave:
+
+        grad_f(d_pi) = beta * r + (1 - beta) * (1 + log(d_pi))
+
+    d_bar, r_vec are vectors over states (same shape).
+    """
+    return beta * r_vec + (1.0 - beta) * (1.0 + torch.log(d_bar + eps))
 
 
 if __name__ == "__main__":
@@ -192,7 +269,8 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -207,16 +285,32 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    assert isinstance(
+        envs.single_action_space, gym.spaces.Discrete
+    ), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    # --- Convex MDP: state-reward vector r(s) and d_pi running average ---
+    n_states = envs.single_observation_space.shape[0]
+    r_vec = build_state_reward_vector(args.env_id, device)  # [n_states]
+
+    # initialize d_bar uniformly and lambda_1 from it
+    d_bar = torch.ones(n_states, device=device) / n_states
+    lambda_vec = grad_f_from_d_bar(
+        d_bar, r_vec, beta=args.beta, eps=args.d_pi_log_epsilon
+    )  # [n_states]
+
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    obs = torch.zeros(
+        (args.num_steps, args.num_envs) + envs.single_observation_space.shape
+    ).to(device)
+    actions = torch.zeros(
+        (args.num_steps, args.num_envs) + envs.single_action_space.shape
+    ).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)  # will store shaped reward -lambda
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
@@ -236,6 +330,7 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        # === Rollout with fixed lambda_vec (cost player FTL; lambda_k is fixed this iteration) ===
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -248,26 +343,56 @@ if __name__ == "__main__":
             actions[step] = action
             logprobs[step] = logprob
 
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            # Execute the game
+            next_obs_np, env_reward, terminations, truncations, infos = envs.step(
+                action.cpu().numpy()
+            )
+            # We keep env_reward only for logging; PPO optimization uses shaped reward.
             next_done = np.logical_or(terminations, truncations)
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
+            # === Convex MDP reward shaping: r'_t = -lambda_k(s_t) ===
+            # obs[step] is one-hot over states; use argmax to get state index.
+            state_indices = obs[step].argmax(dim=-1).long()  # [num_envs]
+            shaped_reward = -lambda_vec[state_indices]  # [num_envs]
+            rewards[step] = shaped_reward
+
+            # Convert next_obs and done to tensors
+            next_obs, next_done = (
+                torch.Tensor(next_obs_np).to(device),
+                torch.Tensor(next_done).to(device),
+            )
+
+            # Logging original environment episodic return (not the convex objective)
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                        writer.add_scalar(
+                            "charts/episodic_return",
+                            info["episode"]["r"],
+                            global_step,
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_length",
+                            info["episode"]["l"],
+                            global_step,
+                        )
                         # update EMA return
                         if ema_return_val is None:
                             ema_return_val = info["episode"]["r"]
                         else:
-                            ema_return_val = ema_return(ema_return_val, info["episode"]["r"])
-                        writer.add_scalar("charts/ema_episodic_return", ema_return_val, global_step)
-                        print(f"global_step={global_step}, ema_episodic_return={ema_return_val}")
+                            ema_return_val = ema_return(
+                                ema_return_val, info["episode"]["r"]
+                            )
+                        writer.add_scalar(
+                            "charts/ema_episodic_return",
+                            ema_return_val,
+                            global_step,
+                        )
+                        print(
+                            f"global_step={global_step}, ema_episodic_return={ema_return_val}"
+                        )
 
-        # bootstrap value if not done
+        # === GAE and returns use shaped reward r' ===
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
@@ -279,8 +404,18 @@ if __name__ == "__main__":
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                delta = (
+                    rewards[t]
+                    + args.gamma * nextvalues * nextnonterminal
+                    - values[t]
+                )
+                advantages[t] = lastgaelam = (
+                    delta
+                    + args.gamma
+                    * args.gae_lambda
+                    * nextnonterminal
+                    * lastgaelam
+                )
             returns = advantages + values
 
         # flatten the batch
@@ -300,7 +435,9 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    b_obs[mb_inds], b_actions.long()[mb_inds]
+                )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -308,15 +445,24 @@ if __name__ == "__main__":
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                    clipfracs += [
+                        ((ratio - 1.0).abs() > args.clip_coef)
+                        .float()
+                        .mean()
+                        .item()
+                    ]
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                        mb_advantages.std() + 1e-8
+                    )
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss2 = -mb_advantages * torch.clamp(
+                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                )
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
@@ -332,10 +478,16 @@ if __name__ == "__main__":
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * (
+                        (newvalue - b_returns[mb_inds]) ** 2
+                    ).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = (
+                    pg_loss
+                    - args.ent_coef * entropy_loss
+                    + v_loss * args.vf_coef
+                )
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -347,10 +499,37 @@ if __name__ == "__main__":
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+        explained_var = (
+            np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+        )
+
+        # === After PPO update: update d_pi, d_bar (FTL), and lambda for next iteration ===
+        with torch.no_grad():
+            d_k = estimate_d_pi_from_obs(
+                obs, eps=args.d_pi_log_epsilon
+            )  # [n_states]
+            d_bar = update_running_average(d_bar, d_k, iteration)
+            lambda_vec = grad_f_from_d_bar(
+                d_bar, r_vec, beta=args.beta, eps=args.d_pi_log_epsilon
+            )
+
+            # Optional logging of convex objective components
+            entropy_d = -(d_bar * torch.log(d_bar + args.d_pi_log_epsilon)).sum()
+            inner_prod = (d_bar * r_vec).sum()
+            f_val = args.beta * inner_prod + (1.0 - args.beta) * entropy_d
+
+            writer.add_scalar(
+                "convex_mdp/entropy_d_bar", entropy_d.item(), global_step
+            )
+            writer.add_scalar(
+                "convex_mdp/inner_prod_d_r", inner_prod.item(), global_step
+            )
+            writer.add_scalar("convex_mdp/f_value", f_val.item(), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar(
+            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+        )
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -358,8 +537,9 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        # print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        writer.add_scalar(
+            "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+        )
 
     envs.close()
     writer.close()

@@ -66,7 +66,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.0
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -93,7 +93,6 @@ def make_env(env_id, idx, capture_video, run_name):
                 desc=None,
                 map_name="4x4",
                 is_slippery=False,
-                render_mode="rgb_array",
                 # success_rate=1.0/3.0,
                 # reward_schedule=(1, 0, 0)
             )            
