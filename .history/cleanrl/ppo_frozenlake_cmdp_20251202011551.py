@@ -74,13 +74,13 @@ class Args:
     """the target KL divergence threshold"""
 
     # === Convex MDP specific arguments ===
-    beta: float = 1.0
+    beta: float = 0.5
     """beta in f(d_pi) = - beta <d_pi, r> + (1-beta)*entropy(d_pi)"""
     use_reward_scale: bool = False
     """whether to use reward scaling"""
     d_bar_log_epsilon: float = 1e-8
     """small epsilon to avoid log(0) in log(d_pi)"""
-    frozenlake_map_name: str = "8x8"
+    frozenlake_map_name: str = "4x4"
     """the name of the frozen lake map"""
 
     # to be filled in runtime
@@ -108,7 +108,7 @@ def make_env(env_id, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             if env_id == "FrozenLake-v1":
-                env = gym.make(env_id, map_name=args.frozenlake_map_name, is_slippery=False)
+                env = gym.make(env_id, is_slippery=False)
             else:
                 env = gym.make(env_id)
 

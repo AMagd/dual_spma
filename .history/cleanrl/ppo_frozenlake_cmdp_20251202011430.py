@@ -74,13 +74,13 @@ class Args:
     """the target KL divergence threshold"""
 
     # === Convex MDP specific arguments ===
-    beta: float = 1.0
+    beta: float = 0.5
     """beta in f(d_pi) = - beta <d_pi, r> + (1-beta)*entropy(d_pi)"""
     use_reward_scale: bool = False
     """whether to use reward scaling"""
     d_bar_log_epsilon: float = 1e-8
     """small epsilon to avoid log(0) in log(d_pi)"""
-    frozenlake_map_name: str = "8x8"
+    frozenlake_map_name: str = "4x4"
     """the name of the frozen lake map"""
 
     # to be filled in runtime
@@ -108,7 +108,7 @@ def make_env(env_id, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             if env_id == "FrozenLake-v1":
-                env = gym.make(env_id, map_name=args.frozenlake_map_name, is_slippery=False)
+                env = gym.make(env_id, is_slippery=False)
             else:
                 env = gym.make(env_id)
 
@@ -386,28 +386,28 @@ if __name__ == "__main__":
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
-                            # writer.add_scalar(
-                            #     "charts/episodic_return",
-                            #     info["episode"]["r"],
-                            #     global_step,
-                            # )
+                            writer.add_scalar(
+                                "charts/episodic_return",
+                                info["episode"]["r"],
+                                global_step,
+                            )
                             # writer.add_scalar(
                             #     "charts/episodic_length",
                             #     info["episode"]["l"],
                             #     global_step,
                             # )
                             # # update EMA return
-                            if ema_return_val is None:
-                                ema_return_val = info["episode"]["r"]
-                            else:
-                                ema_return_val = ema_return(
-                                    ema_return_val, info["episode"]["r"]
-                                )
-                            writer.add_scalar(
-                                "charts/ema_episodic_return",
-                                ema_return_val,
-                                global_step,
-                            )
+                            # if ema_return_val is None:
+                            #     ema_return_val = info["episode"]["r"]
+                            # else:
+                            #     ema_return_val = ema_return(
+                            #         ema_return_val, info["episode"]["r"]
+                            #     )
+                            # writer.add_scalar(
+                            #     "charts/ema_episodic_return",
+                            #     ema_return_val,
+                            #     global_step,
+                            # )
                             print(
                                 f"global_step={global_step}, ema_episodic_return={ema_return_val}"
                             )
@@ -558,7 +558,7 @@ if __name__ == "__main__":
             entropy_d = -(d_bar * torch.log(d_bar + args.d_bar_log_epsilon)).sum()
 
             writer.add_scalar(
-                "charts/entropy_d_bar", entropy_d.item(), global_step
+                "convex_mdp/entropy_d_bar", entropy_d.item(), global_step
             )
 
     envs.close()

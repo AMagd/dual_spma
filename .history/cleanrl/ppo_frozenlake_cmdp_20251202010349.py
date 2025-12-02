@@ -74,13 +74,11 @@ class Args:
     """the target KL divergence threshold"""
 
     # === Convex MDP specific arguments ===
-    beta: float = 1.0
+    beta: float = 0.5
     """beta in f(d_pi) = - beta <d_pi, r> + (1-beta)*entropy(d_pi)"""
-    use_reward_scale: bool = False
-    """whether to use reward scaling"""
     d_bar_log_epsilon: float = 1e-8
     """small epsilon to avoid log(0) in log(d_pi)"""
-    frozenlake_map_name: str = "8x8"
+    frozenlake_map_name: str = "4x4"
     """the name of the frozen lake map"""
 
     # to be filled in runtime
@@ -108,7 +106,7 @@ def make_env(env_id, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             if env_id == "FrozenLake-v1":
-                env = gym.make(env_id, map_name=args.frozenlake_map_name, is_slippery=False)
+                env = gym.make(env_id, is_slippery=False)
             else:
                 env = gym.make(env_id)
 
@@ -236,7 +234,7 @@ def update_running_average(old_avg: torch.Tensor, new_value: torch.Tensor, k: in
         return new_value
     return (old_avg * (k - 1) + new_value) / k
 
-def lambda_reward_reshape(r, d_bar, beta, eps, use_reward_scale=False):
+def lambda_reward_reshape(r, d_bar, beta, eps):
     """
     modify the reward based on the convex MDP objective
     
@@ -249,10 +247,7 @@ def lambda_reward_reshape(r, d_bar, beta, eps, use_reward_scale=False):
     #     beta = torch.tensor(beta)
     # if not isinstance(eps, torch.Tensor):
     #     eps = torch.tensor(eps)
-    if use_reward_scale:
-        r_new = - beta * max_possible_entropy * r + (1.0 - beta) * (1.0 + torch.log(d_bar + eps))
-    else:
-        r_new = - beta * r + (1.0 - beta) * (1.0 + torch.log(d_bar + eps))
+    r_new = - beta * r + (1.0 - beta) * (1.0 + torch.log(d_bar + eps))
     return r_new
 
 
@@ -263,9 +258,9 @@ if __name__ == "__main__":
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"ppo_cmdp__{args.beta}__{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    n_possible_states = int(args.frozenlake_map_name.split("x")[0]) ** 2
+    n_possible_states = args.frozenlake_map_name.split("x")[0] ** 2
     n_possible_actions = 4
-    max_possible_entropy = - np.log(1 / (n_possible_states * n_possible_actions))
+    max_possible_entropy = np.log(1 / (n_possible_states * n_possible_actions))
     reward_scale = max_possible_entropy
 
     if args.track:
@@ -373,7 +368,7 @@ if __name__ == "__main__":
                 # obs[step] is one-hot over states; use argmax to get state index.
                 state_indices = obs[step].argmax(dim=-1).long()  # [num_envs]
                 d_bar_value = d_bar[state_indices, action]
-                shaped_reward = -lambda_reward_reshape(env_reward, d_bar_value, args.beta, args.d_bar_log_epsilon, args.use_reward_scale)
+                shaped_reward = -lambda_reward_reshape(env_reward, d_bar_value, args.beta, args.d_bar_log_epsilon)
                 rewards[step] = shaped_reward
 
                 # Convert next_obs and done to tensors
@@ -386,17 +381,17 @@ if __name__ == "__main__":
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
-                            # writer.add_scalar(
-                            #     "charts/episodic_return",
-                            #     info["episode"]["r"],
-                            #     global_step,
-                            # )
-                            # writer.add_scalar(
-                            #     "charts/episodic_length",
-                            #     info["episode"]["l"],
-                            #     global_step,
-                            # )
-                            # # update EMA return
+                            writer.add_scalar(
+                                "charts/episodic_return",
+                                info["episode"]["r"],
+                                global_step,
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_length",
+                                info["episode"]["l"],
+                                global_step,
+                            )
+                            # update EMA return
                             if ema_return_val is None:
                                 ema_return_val = info["episode"]["r"]
                             else:
@@ -535,9 +530,9 @@ if __name__ == "__main__":
             )
 
             # TRY NOT TO MODIFY: record rewards for plotting purposes
-            # writer.add_scalar(
-            #     "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
-            # )
+            writer.add_scalar(
+                "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+            )
             writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
             writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
             writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -545,9 +540,9 @@ if __name__ == "__main__":
             writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
             writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
-            # writer.add_scalar(
-            #     "charts/SPS", int(global_step / (time.time() - start_time)), global_step
-            # )
+            writer.add_scalar(
+                "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+            )
 
         # === After PPO update: update d_pi, d_bar (FTL), and lambda for next iteration ===
         with torch.no_grad():
@@ -558,7 +553,7 @@ if __name__ == "__main__":
             entropy_d = -(d_bar * torch.log(d_bar + args.d_bar_log_epsilon)).sum()
 
             writer.add_scalar(
-                "charts/entropy_d_bar", entropy_d.item(), global_step
+                "convex_mdp/entropy_d_bar", entropy_d.item(), global_step
             )
 
     envs.close()

@@ -108,7 +108,7 @@ def make_env(env_id, idx, capture_video, run_name):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             if env_id == "FrozenLake-v1":
-                env = gym.make(env_id, map_name=args.frozenlake_map_name, is_slippery=False)
+                env = gym.make(env_id, is_slippery=False)
             else:
                 env = gym.make(env_id)
 
